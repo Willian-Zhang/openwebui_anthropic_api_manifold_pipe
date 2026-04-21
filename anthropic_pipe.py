@@ -4,9 +4,9 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.1
+version: 0.8.1-bedrock
 license: MIT
-requirements: pydantic>=2.0.0, anthropic>=0.75.0
+requirements: pydantic>=2.0.0, anthropic>=0.96.0
 environment_variables:
     - ANTHROPIC_API_KEY (required)
 
@@ -291,6 +291,16 @@ from anthropic import (
     NotFoundError,
     UnprocessableEntityError,
 )
+
+# Bedrock support — optional dependency
+try:
+    from anthropic import AsyncAnthropicBedrock
+
+    BEDROCK_AVAILABLE = True
+except ImportError:
+    AsyncAnthropicBedrock = None  # type: ignore
+    BEDROCK_AVAILABLE = False
+
 from typing import Literal
 from fastapi import Request
 
@@ -511,6 +521,22 @@ class Pipe:
         "claude-opus-4-5": "claude-opus-4-5-20251101",
     }
 
+    # Bedrock model ID mapping: Anthropic model name → Bedrock model ID
+    # Bedrock requires cross-region inference profile IDs for on-demand throughput.
+    # Format: {region_prefix}.anthropic.{model-name}-v{version}:{minor}
+    # Region prefixes: "us" (US cross-region), "eu" (EU cross-region)
+    # The prefix is added by _resolve_model_for_api based on BEDROCK_CROSS_REGION_PREFIX valve.
+    BEDROCK_MODEL_IDS = {
+        "claude-sonnet-4-20250514": "anthropic.claude-sonnet-4-20250514-v1:0",
+        "claude-opus-4-20250514": "anthropic.claude-opus-4-20250514-v1:0",
+        "claude-opus-4-1-20250805": "anthropic.claude-opus-4-1-20250805-v1:0",
+        "claude-sonnet-4-5-20250929": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "claude-haiku-4-5-20251001": "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "claude-opus-4-5-20251101": "anthropic.claude-opus-4-5-20251101-v1:0",
+        "claude-opus-4-6": "anthropic.claude-opus-4-6-v1",
+        "claude-sonnet-4-6": "anthropic.claude-sonnet-4-6-v1",
+    }
+
     REQUEST_TIMEOUT = (
         300  # Increased timeout for longer responses with extended thinking
     )
@@ -673,6 +699,37 @@ class Pipe:
             default="global",
             description='Data residency for API requests. 1.1x Token Cost for "us".',
         )
+        # =====================================================================
+        # AWS BEDROCK SETTINGS
+        # =====================================================================
+        ENABLE_BEDROCK: bool = Field(
+            default=False,
+            description="Use AWS Bedrock instead of the Anthropic API. Requires anthropic[bedrock] package and AWS credentials.",
+        )
+        AWS_ACCESS_KEY: str = Field(
+            default="",
+            description="AWS access key ID for Bedrock. Leave empty to use default AWS credential chain (env vars, ~/.aws/credentials, IAM role).",
+        )
+        AWS_SECRET_KEY: str = Field(
+            default="",
+            description="AWS secret access key for Bedrock. Leave empty to use default AWS credential chain.",
+        )
+        AWS_SESSION_TOKEN: str = Field(
+            default="",
+            description="AWS session token for temporary credentials. Optional.",
+        )
+        AWS_REGION: str = Field(
+            default="us-west-2",
+            description="AWS region for Bedrock API calls (e.g., us-east-1, us-west-2, eu-west-1).",
+        )
+        AWS_PROFILE: str = Field(
+            default="",
+            description="AWS CLI profile name to use for credentials. Leave empty for default.",
+        )
+        BEDROCK_CROSS_REGION_PREFIX: str = Field(
+            default="us",
+            description="Cross-region inference profile prefix prepended to model IDs. Valid: 'us' (US regions), 'eu' (EU regions). Leave empty for no prefix. NOTE: 'global' is NOT valid for Bedrock.",
+        )
 
     class UserValves(BaseModel):
         ENABLE_THINKING: bool = Field(
@@ -755,14 +812,112 @@ class Pipe:
             {}
         )
 
+    @property
+    def is_bedrock(self) -> bool:
+        """Check if Bedrock mode is enabled."""
+        return self.valves.ENABLE_BEDROCK and BEDROCK_AVAILABLE
+
+    def _create_client(self, api_key: str = None, default_headers: dict = None):
+        """
+        Create the appropriate async client based on configuration.
+        Returns AsyncAnthropic or AsyncAnthropicBedrock.
+
+        For Bedrock, api_key and default_headers are ignored (AWS SigV4 auth is used).
+        """
+        if self.is_bedrock:
+            kwargs = {}
+            # Only pass aws_region if non-empty (SDK defaults to AWS_REGION env var or us-east-1)
+            if self.valves.AWS_REGION and self.valves.AWS_REGION.strip():
+                kwargs["aws_region"] = self.valves.AWS_REGION.strip()
+            # Only pass credentials if BOTH access key and secret key are provided.
+            # Passing only one or passing empty strings breaks the SDK's default
+            # credential chain (env vars, ~/.aws/credentials, IAM role, etc.)
+            access_key = self.valves.AWS_ACCESS_KEY.strip() if self.valves.AWS_ACCESS_KEY else ""
+            secret_key = self.valves.AWS_SECRET_KEY.strip() if self.valves.AWS_SECRET_KEY else ""
+            if access_key and secret_key:
+                kwargs["aws_access_key"] = access_key
+                kwargs["aws_secret_key"] = secret_key
+                # Session token is only meaningful with explicit credentials
+                session_token = self.valves.AWS_SESSION_TOKEN.strip() if self.valves.AWS_SESSION_TOKEN else ""
+                if session_token:
+                    kwargs["aws_session_token"] = session_token
+            elif access_key or secret_key:
+                logger.warning(
+                    "Bedrock: Both AWS_ACCESS_KEY and AWS_SECRET_KEY must be set together. "
+                    "Falling back to default AWS credential chain."
+                )
+            # Profile is independent of explicit credentials
+            if self.valves.AWS_PROFILE and self.valves.AWS_PROFILE.strip():
+                kwargs["aws_profile"] = self.valves.AWS_PROFILE.strip()
+            try:
+                return AsyncAnthropicBedrock(**kwargs)
+            except Exception as e:
+                logger.error(f"Failed to create Bedrock client: {e}")
+                raise ValueError(
+                    f"Failed to initialize AWS Bedrock client. "
+                    f"Ensure AWS credentials are configured (env vars AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, "
+                    f"~/.aws/credentials, IAM role, or set them in the Bedrock Valves). Error: {e}"
+                ) from e
+        else:
+            kwargs = {"api_key": api_key or self.valves.ANTHROPIC_API_KEY}
+            if default_headers:
+                kwargs["default_headers"] = default_headers
+            return AsyncAnthropic(**kwargs)
+
+    def _resolve_model_for_api(self, model_name: str) -> str:
+        """
+        Resolve a model name to the correct API model ID.
+        For Bedrock, maps to Bedrock model IDs with optional global prefix.
+        For direct API, returns the model name as-is.
+        """
+        # First resolve any aliases
+        resolved = self.MODEL_ALIASES.get(model_name, model_name)
+
+        if self.is_bedrock:
+            bedrock_id = self.BEDROCK_MODEL_IDS.get(resolved)
+            if not bedrock_id:
+                # Fallback: construct a reasonable Bedrock ID
+                bedrock_id = f"anthropic.{resolved}-v1:0"
+                logger.warning(f"No Bedrock model ID mapping for '{resolved}', using: {bedrock_id}")
+
+            # Add cross-region inference profile prefix (required for on-demand throughput)
+            prefix = self.valves.BEDROCK_CROSS_REGION_PREFIX
+            if prefix:
+                bedrock_id = f"{prefix}.{bedrock_id}"
+            return bedrock_id
+
+        return resolved
+
     async def get_anthropic_models(self) -> List[dict]:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
+        For Bedrock, always uses static list (Bedrock has no models.list() equivalent in SDK).
         Fallback to static list on error. Returns OpenWebUI model dicts.
         """
+        models = []
+
+        # Bedrock mode: always use static list (no models.list() API)
+        if self.is_bedrock:
+            for name, info in self.MODEL_CAPABILITIES.items():
+                # Only include models that have a Bedrock mapping
+                if name not in self.BEDROCK_MODEL_IDS:
+                    continue
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": f"{name} (Bedrock)",
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+                    }
+                )
+            return models
+
         from anthropic import AsyncAnthropic
 
-        models = []
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
             client = AsyncAnthropic(api_key=api_key)
@@ -1226,7 +1381,11 @@ class Pipe:
         api_key: str,
         user_id: str,
     ) -> str:
-        """Download file from Anthropic Files API, save to OpenWebUI, return markdown link."""
+        """Download file from Anthropic Files API, save to OpenWebUI, return markdown link.
+        Note: Files API is NOT available on Bedrock — this will fail gracefully.
+        """
+        if self.is_bedrock:
+            return f"⚠️ File download not available on Bedrock (file: {file_id})"
         try:
             from anthropic import AsyncAnthropic
             import hashlib
@@ -1308,6 +1467,10 @@ class Pipe:
         current_user_msg_num = max(0, user_msg_count - 1)  # 0-based
 
         client = None
+        # Files API is NOT available on Bedrock
+        if self.is_bedrock:
+            logger.warning("Files API is not available on Bedrock. Skipping file uploads.")
+            return blocks_by_user_msg, processed_filenames
         try:
             from anthropic import AsyncAnthropic
             client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY)
@@ -1435,11 +1598,13 @@ class Pipe:
         ## General payload creation
         actual_model_name = body["model"].split("/")[-1]
         model_info = self.get_model_info(actual_model_name)
+        # Resolve to the correct API model ID (Bedrock IDs differ from Anthropic IDs)
+        api_model_name = self._resolve_model_for_api(actual_model_name)
         max_tokens_limit = model_info["max_tokens"]
         requested_max_tokens = body.get("max_tokens", max_tokens_limit)
         max_tokens = min(requested_max_tokens, max_tokens_limit)
         payload: dict[str, Any] = {
-            "model": actual_model_name,
+            "model": api_model_name,
             "max_tokens": max_tokens,
             "stream": body.get("stream", True),
             "metadata": body.get("metadata", {}),
@@ -1909,6 +2074,30 @@ class Pipe:
 
         payload["messages"] = processed_messages
 
+        # =====================================================================
+        # BEDROCK PAYLOAD CLEANUP
+        # Bedrock uses the Anthropic Messages API but some parameters are
+        # not supported or behave differently. Clean up the payload here.
+        # =====================================================================
+        if self.is_bedrock:
+            # Remove Anthropic-only parameters that Bedrock doesn't support
+            payload.pop("metadata", None)  # Bedrock doesn't support metadata
+            payload.pop("inference_geo", None)  # Data residency is handled via regional endpoints
+            payload.pop("speed", None)  # Fast mode is Anthropic-only
+
+            # Remove container/skills — Files API and Skills are Anthropic-only
+            if "container" in payload and isinstance(payload.get("container"), list):
+                # Skills container — remove it
+                payload.pop("container", None)
+            # Note: container_id (string) for code execution state is kept — Bedrock
+            # supports code execution with containers
+
+            # Remove Anthropic-specific headers (Bedrock uses AWS SigV4, not x-api-key)
+            headers.pop("x-api-key", None)
+            headers.pop("anthropic-version", None)
+            headers.pop("content-type", None)
+            # Beta headers are passed via the 'betas' key in the payload for SDK usage
+
         return payload, headers, new_marker_metadata
 
     def _convert_messages_to_claude_format(
@@ -2054,9 +2243,17 @@ class Pipe:
             logger.debug("No user tools to convert")
 
         # Add web search tool if enabled OR if metadata enforces it (even if valve is disabled)
-        web_search_enabled = self.valves.WEB_SEARCH or __metadata__.get(
+        # NOTE: Bedrock does NOT support Anthropic's built-in web_search or web_fetch tools.
+        # These server-side tools are only available on: Claude API (direct), Azure, Vertex AI.
+        web_search_requested = self.valves.WEB_SEARCH or __metadata__.get(
             "web_search_enforced", False
         )
+        if web_search_requested and self.is_bedrock:
+            logger.warning(
+                "⚠️ Web search is not supported on AWS Bedrock. "
+                "Skipping web_search tool. Use direct Anthropic API for web search."
+            )
+        web_search_enabled = web_search_requested and not self.is_bedrock
         if web_search_enabled:
             # Get user location values with fallback to global valves
             city = (
@@ -2079,9 +2276,10 @@ class Pipe:
             # Build web search tool config
             # web_search_20260209 has dynamic filtering (code execution post-processes results)
             # web_search_20250305 works on all models without dynamic filtering
+            # Bedrock only supports web_search_20250305
             model_info_ws = self.get_model_info(actual_model_name)
             use_dynamic = __user__["valves"].ENABLE_DYNAMIC_FILTERING
-            if use_dynamic and model_info_ws.get("supports_dynamic_filtering", False):
+            if use_dynamic and model_info_ws.get("supports_dynamic_filtering", False) and not self.is_bedrock:
                 web_search_type = "web_search_20260209"
             else:
                 web_search_type = "web_search_20250305"
@@ -2113,10 +2311,11 @@ class Pipe:
         # Add web_fetch tool if enabled
         # web_fetch_20260209 has dynamic filtering (requires code execution)
         # web_fetch_20250910 works on all models without dynamic filtering
+        # NOTE: Bedrock does NOT support web_fetch at all - only web_search_20250305
         model_info = self.get_model_info(actual_model_name)
-        if self.valves.WEB_FETCH:
+        if self.valves.WEB_FETCH and not self.is_bedrock:
             use_dynamic_fetch = __user__["valves"].ENABLE_DYNAMIC_FILTERING
-            if use_dynamic_fetch and model_info.get("supports_dynamic_filtering", False):
+            if use_dynamic_fetch and model_info.get("supports_dynamic_filtering", False) and not self.is_bedrock:
                 web_fetch_type = "web_fetch_20260209"
             else:
                 web_fetch_type = "web_fetch_20250910"
@@ -2495,9 +2694,9 @@ class Pipe:
                 elif user_valves:
                     logger.debug(f"UserValves: {user_valves}")
 
-            # Get API key
+            # Get API key (not required for Bedrock — uses AWS credentials)
             api_key = self.valves.ANTHROPIC_API_KEY
-            if not api_key:
+            if not api_key and not self.is_bedrock:
                 error_msg = "Error: No API key configured"
                 logger.error(f"{error_msg}")
                 await emit_event_local(
@@ -2507,6 +2706,18 @@ class Pipe:
                             "description": "No API Key Set!",
                             "done": False,
                         },
+                    }
+                )
+                return error_msg
+
+            # Bedrock availability check
+            if self.valves.ENABLE_BEDROCK and not BEDROCK_AVAILABLE:
+                error_msg = "Error: Bedrock enabled but anthropic[bedrock] package not installed. Run: pip install 'anthropic[bedrock]'"
+                logger.error(error_msg)
+                await emit_event_local(
+                    {
+                        "type": "status",
+                        "data": {"description": "❌ Bedrock package not installed", "done": True},
                     }
                 )
                 return error_msg
@@ -2657,7 +2868,7 @@ class Pipe:
             # PHASE 3: STREAMING STATE INITIALIZATION
             # =========================================================================
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            client = self._create_client(api_key=api_key, default_headers=headers)
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
             include_usage = body.get("stream_options", {}).get("include_usage", False)
             if include_usage:
@@ -2803,9 +3014,48 @@ class Pipe:
                     )
 
                     stream_event_counts = {}  # Track event types for diagnostics
-                    async with client.beta.messages.stream(
-                        **payload_for_stream
-                    ) as stream:
+                    # For Bedrock, use client.messages.stream() since beta.messages
+                    # doesn't have stream() on Bedrock. Beta features are passed via
+                    # extra_headers. We must strip parameters that the non-beta
+                    # messages.stream() doesn't accept.
+                    if self.is_bedrock:
+                        # Parameters accepted by non-beta messages.stream():
+                        # max_tokens, messages, model, system, temperature, top_k, top_p,
+                        # stop_sequences, tools, tool_choice, thinking, metadata
+                        # Beta-only params that must be removed:
+                        _bedrock_strip_keys = {
+                            "betas", "context_management", "mcp_servers", "speed",
+                            "output_config", "cache_control", "service_tier",
+                            "inference_geo", "output_format", "container",
+                            "tool_choice", "metadata",
+                        }
+                        bedrock_payload = {k: v for k, v in payload_for_stream.items()
+                                           if k not in _bedrock_strip_keys}
+                        
+                        # Recursively strip cache_control from nested structures (messages, system, tools)
+                        # Also strip beta-only tool properties that Bedrock doesn't support
+                        _bedrock_strip_nested_keys = {"cache_control", "eager_input_streaming", "allowed_callers", "defer_loading"}
+                        def strip_unsupported_keys(obj):
+                            if isinstance(obj, dict):
+                                return {k: strip_unsupported_keys(v) for k, v in obj.items() if k not in _bedrock_strip_nested_keys}
+                            elif isinstance(obj, list):
+                                return [strip_unsupported_keys(item) for item in obj]
+                            return obj
+                        
+                        bedrock_payload = strip_unsupported_keys(bedrock_payload)
+                        logger.debug(f"🔧 Bedrock payload keys: {list(bedrock_payload.keys())}")
+                        logger.debug(f"🔧 Bedrock payload tools: {bedrock_payload.get('tools', 'NO TOOLS')}")
+                        logger.debug(f"🔧 Bedrock payload thinking: {bedrock_payload.get('thinking', 'NO THINKING')}")
+                        logger.info(f"🔧 FULL Bedrock payload: {json.dumps(bedrock_payload, indent=2, default=str)}")
+                        # Bedrock does not support beta headers at all - don't pass them
+                        stream_ctx = client.messages.stream(
+                            **bedrock_payload,
+                        )
+                    else:
+                        stream_ctx = client.beta.messages.stream(
+                            **payload_for_stream
+                        )
+                    async with stream_ctx as stream:
                         async for event in stream:
                             event_type = getattr(event, "type", None)
                             stream_event_counts[event_type] = stream_event_counts.get(event_type, 0) + 1
@@ -4376,6 +4626,28 @@ class Pipe:
                     return final_text() + (
                         f"\n\nError: Anthropic API error. Reason: {e.message}"
                     )
+                except (RuntimeError, ValueError) as e:
+                    # Catch credential/config errors (e.g., Bedrock auth failures)
+                    error_str = str(e)
+                    if "credentials" in error_str.lower() or "bedrock" in error_str.lower():
+                        error_msg = (
+                            f"\n\n❌ **AWS Bedrock Authentication Failed**\n\n"
+                            f"Could not resolve AWS credentials. Please configure one of:\n\n"
+                            f"1. **Valve settings**: Set both `AWS_ACCESS_KEY` and `AWS_SECRET_KEY` in the Bedrock admin valves\n"
+                            f"2. **Environment variables**: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`\n"
+                            f"3. **AWS credentials file**: `~/.aws/credentials`\n"
+                            f"4. **AWS profile**: Set `AWS_PROFILE` valve to a configured profile name\n"
+                            f"5. **IAM role**: If running on AWS (EC2/ECS/Lambda)\n\n"
+                            f"Error: {error_str}"
+                        )
+                        await self.handle_errors(e, __event_emitter__)
+                        return final_text() + error_msg
+                    # Non-credential RuntimeError/ValueError — fall through to generic handler
+                    await self.handle_errors(e, __event_emitter__)
+                    return (
+                        final_text()
+                        + f"\n\nError: {type(e).__name__} occurred. Reason: {e}"
+                    )
                 except Exception as e:
                     # Catch all other exceptions
                     await self.handle_errors(e, __event_emitter__)
@@ -4459,11 +4731,12 @@ class Pipe:
         try:
             # Extract model and messages from body
             actual_model_name = body["model"].split("/")[-1]
+            api_model_name = self._resolve_model_for_api(actual_model_name)
             messages = body.get("messages", [])
 
             # Build simple payload for task request (non-streaming)
             task_payload = {
-                "model": actual_model_name,
+                "model": api_model_name,
                 "max_tokens": body.get("max_tokens", 4096),
                 "messages": self._process_messages_for_task(messages),
                 "stream": False,
@@ -4471,10 +4744,9 @@ class Pipe:
 
             logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
 
-            # Make synchronous request to Anthropic API
+            # Make request to Anthropic/Bedrock API
             # For task requests, we don't have __user__ context, so use default key
-            api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            client = self._create_client()
 
             response = await client.messages.create(**task_payload)
 
@@ -5207,6 +5479,11 @@ class Pipe:
             List of validated skill configurations for the container parameter
         """
         if not skill_names:
+            return []
+
+        # Skills API is NOT available on Bedrock
+        if self.is_bedrock:
+            logger.warning("Skills API is not available on Bedrock. Skipping skill validation.")
             return []
 
         # Initialize cache for this API key if needed
